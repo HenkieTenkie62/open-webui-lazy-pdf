@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount, onDestroy, tick } from 'svelte';
-	import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
 	import panzoom, { type PanZoom } from 'panzoom';
 	import { clampDocumentTargetPage } from '$lib/utils/documentPreview';
+	import { loadPdfJs, PDF_DOCUMENT_OPTIONS } from '$lib/utils/pdf';
 	import Spinner from './Spinner.svelte';
 
 	export let url: string | null = null;
@@ -41,21 +41,42 @@
 
 	$: selectedPage = singlePage ? (clampDocumentTargetPage(targetPage, pageCount) ?? 1) : activePage;
 
-	// Keep a reference to TextLayer instances so we can update/cancel them
-	let textLayerInstances: PdfTextLayer[] = [];
+	// Keep a reference to TextLayer instances (by page number) so we can update/cancel them
+	let textLayerByPage: Map<number, PdfTextLayer> = new Map();
+
+	// Lazy (virtualized) rendering state for continuous mode: page placeholders are
+	// created immediately while canvas + text layer rendering is deferred to pages
+	// near the viewport, and freed again once they scroll far out of view. This
+	// makes opening and page-jumping instant even for documents with 900+ pages.
+	let pageObserver: IntersectionObserver | null = null;
+	let farPageObserver: IntersectionObserver | null = null;
+	let renderedPages: Set<number> = new Set();
+	let wantedPages: Set<number> = new Set();
+	let pagesInRenderRange: Set<number> = new Set();
+	let pageRenderZoom: Map<number, number> = new Map();
+	let renderQueue: number[] = [];
+	let renderQueueRunning = false;
+	// Strict priority: while set, only this page is rendered — everything else
+	// stays queued until the requested/visible page has been served.
+	let priorityPage: number | null = null;
+	// LRU of rendered pages (oldest first): recently rendered pages stay alive
+	// so scrolling back is instant; overflow frees the least recent ones.
+	let renderCacheOrder: number[] = [];
+	const maxRenderCachePages =
+		typeof window !== 'undefined' && (window.devicePixelRatio || 1) >= 2 ? 8 : 14;
 
 	const copyPdfData = (pdfData: ArrayBuffer | Uint8Array) =>
 		pdfData instanceof Uint8Array ? pdfData.slice() : pdfData.slice(0);
 
 	const cancelTextLayers = () => {
-		for (const tl of textLayerInstances) {
+		for (const tl of textLayerByPage.values()) {
 			try {
 				tl.cancel();
 			} catch {
 				// Text layers can already be resolved or canceled during rerenders.
 			}
 		}
-		textLayerInstances = [];
+		textLayerByPage = new Map();
 	};
 
 	const initPanzoom = () => {
@@ -158,6 +179,9 @@
 		pageWrapper?.scrollIntoView({ block: 'start' });
 		activePage = page;
 		onPageChange?.(page);
+		// The requested page renders with strict priority and shows first;
+		// the ±2 neighbors warm up only after it has been served.
+		setPriorityPage(page);
 	};
 
 	const syncVisiblePage = () => {
@@ -185,6 +209,9 @@
 		if (bestPage !== activePage) {
 			activePage = bestPage;
 			onPageChange?.(bestPage);
+			// The page closest to the scroll position gets rendering priority,
+			// followed by its ±2 neighbors.
+			setPriorityPage(bestPage);
 		}
 	};
 
@@ -193,53 +220,24 @@
 		scrollFrame = requestAnimationFrame(syncVisiblePage);
 	};
 
-	// Re-render existing canvases at a new zoom level (preserves panzoom transform)
+	// Zoom changed: re-render canvases at a higher internal resolution so text
+	// stays crisp. With lazy rendering we only refresh pages that are currently
+	// in/near the viewport; off-screen pages are marked stale and re-rendered
+	// when they scroll back into view.
 	const rerenderPages = async (forZoom: number) => {
 		if (!pdfDoc || !sceneElement) return;
-		const pdfjs = await import('pdfjs-dist');
-		const dpr = window.devicePixelRatio || 1;
-
-		const pageWrappers = sceneElement.querySelectorAll('.pdf-page-wrapper');
-
-		cancelTextLayers();
-
-		for (let i = 0; i < pageWrappers.length; i++) {
-			const page = await pdfDoc.getPage(singlePage ? selectedPage : i + 1);
-			const viewport = page.getViewport({ scale: 1 });
-			const cssScale = getCssScale(viewport);
-			const renderScale = cssScale * forZoom * dpr;
-			const scaledViewport = page.getViewport({ scale: renderScale });
-			const cssViewport = page.getViewport({ scale: cssScale });
-
-			const wrapper = pageWrappers[i] as HTMLElement;
-			// Update the CSS custom property so textLayer dimensions resolve correctly
-			wrapper.style.setProperty('--scale-factor', String(cssViewport.scale));
-
-			const canvas = wrapper.querySelector('canvas')!;
-			canvas.width = scaledViewport.width;
-			canvas.height = scaledViewport.height;
-
-			const ctx = canvas.getContext('2d');
-			if (ctx) {
-				await page.render({ canvas, canvasContext: ctx, viewport: scaledViewport }).promise;
-			}
-
-			// Rebuild text layer
-			const textLayerDiv = wrapper.querySelector('.textLayer') as HTMLElement;
-			if (textLayerDiv) {
-				textLayerDiv.innerHTML = '';
-
-				const textContent = await page.getTextContent();
-				const textLayer = new pdfjs.TextLayer({
-					textContentSource: textContent,
-					container: textLayerDiv,
-					viewport: cssViewport
-				});
-				await textLayer.render();
-				textLayerInstances.push(textLayer);
-			}
-		}
 		lastRenderedZoom = forZoom;
+
+		if (singlePage) {
+			await renderPageInto(clampDocumentTargetPage(selectedPage, pdfDoc.numPages) ?? selectedPage);
+			return;
+		}
+
+		for (const page of Array.from(pageRenderZoom.keys())) {
+			if (pageRenderZoom.get(page) === forZoom) continue;
+			pageRenderZoom.delete(page);
+			enqueuePageRender(page, wantedPages.has(page));
+		}
 	};
 
 	const getCssScale = (viewport: { width: number; height: number }) => {
@@ -250,6 +248,8 @@
 		return Math.min(1, availableWidth / viewport.width, availableHeight / viewport.height);
 	};
 
+	// Single page mode: only the selected page lives in the scene, so we render
+	// it directly — no virtualization needed there.
 	const renderAllPages = async () => {
 		if (!pdfDoc || !sceneElement) return;
 		const token = ++renderToken;
@@ -258,84 +258,429 @@
 		sceneElement.innerHTML = '';
 
 		cancelTextLayers();
+		pageObserver?.disconnect();
+		farPageObserver?.disconnect();
+		renderedPages = new Set();
+		wantedPages = new Set();
+		pagesInRenderRange = new Set();
+		pageRenderZoom = new Map();
+		renderQueue = [];
+		priorityPage = null;
+		renderCacheOrder = [];
 
-		const pdfjs = await import('pdfjs-dist');
-		const dpr = window.devicePixelRatio || 1;
+		const pageNumber = clampDocumentTargetPage(targetPage, pdfDoc.numPages) ?? 1;
+		const page = await pdfDoc.getPage(pageNumber);
+		if (token !== renderToken) return;
+		const viewport = page.getViewport({ scale: 1 });
+
+		// Scale to fit the container while keeping the whole page visible
+		const cssScale = getCssScale(viewport);
+
+		const wrapper = document.createElement('div');
+		wrapper.className = 'pdf-page-wrapper';
+		wrapper.dataset.pageNumber = String(pageNumber);
+		wrapper.style.position = 'relative';
+		wrapper.style.width = `${Math.round(cssScale * viewport.width)}px`;
+		wrapper.style.height = `${Math.round(cssScale * viewport.height)}px`;
+		wrapper.style.display = 'block';
+		wrapper.style.setProperty('--scale-factor', String(cssScale));
+
+		sceneElement.replaceChildren(wrapper);
+		renderedPage = pageNumber;
+		initPanzoom();
+
+		await renderPageInto(pageNumber);
+	};
+
+	// Continuous mode: build lightweight placeholders for every page up front so
+	// document height, scrollbar and page jumps are instant. Canvas + text layer
+	// rendering is deferred to pages near the viewport (see watchPages), which
+	// makes opening large documents (900+ pages) take milliseconds instead of
+	// minutes.
+	const buildPagesStructure = async () => {
+		if (!pdfDoc || !sceneElement) return;
+		const token = ++renderToken;
+
+		// Clear previous content
+		sceneElement.innerHTML = '';
+
+		cancelTextLayers();
+		pageObserver?.disconnect();
+		farPageObserver?.disconnect();
+		renderedPages = new Set();
+		wantedPages = new Set();
+		pagesInRenderRange = new Set();
+		pageRenderZoom = new Map();
+		renderQueue = [];
+		priorityPage = null;
+		renderCacheOrder = [];
+
+		// The requested page is fetched first and its size seeds the placeholders
+		// for every other page, so the document appears immediately without
+		// waiting for all page dimensions. Real dimensions are refined in the
+		// background by refinePageDimensions() without blocking rendering.
+		const numPages = pdfDoc.numPages;
+		const requestedPage = clampDocumentTargetPage(targetPage, numPages) ?? 1;
+		const requestedPdfPage = await pdfDoc.getPage(requestedPage);
+		if (token !== renderToken) return;
+		const requestedViewport = requestedPdfPage.getViewport({ scale: 1 });
+		const fallbackWidth = requestedViewport.width;
+		const fallbackHeight = requestedViewport.height;
+
 		const wrappers: HTMLElement[] = [];
-		const firstPage = singlePage ? selectedPage : 1;
-		const lastPage = singlePage ? selectedPage : pdfDoc.numPages;
-
-		for (let i = firstPage; i <= lastPage; i++) {
-			const page = await pdfDoc.getPage(i);
-			if (token !== renderToken) return;
-			const viewport = page.getViewport({ scale: 1 });
-
+		for (let i = 1; i <= numPages; i++) {
 			// Scale to fit container width
-			const cssScale = getCssScale(viewport);
-			const renderScale = cssScale * dpr;
-			const scaledViewport = page.getViewport({ scale: renderScale });
-			const cssViewport = page.getViewport({ scale: cssScale });
+			const cssScale = getCssScale({ width: fallbackWidth, height: fallbackHeight });
 
-			// Create page wrapper (positioned container for canvas + text layer)
+			// Create page wrapper placeholder (positioned container for canvas + text layer)
 			const wrapper = document.createElement('div');
 			wrapper.className = 'pdf-page-wrapper';
 			wrapper.dataset.pageNumber = String(i);
 			wrapper.style.position = 'relative';
-			wrapper.style.width = `${Math.round(cssScale * viewport.width)}px`;
-			wrapper.style.height = `${Math.round(cssScale * viewport.height)}px`;
+			wrapper.style.width = `${Math.round(cssScale * fallbackWidth)}px`;
+			wrapper.style.height = `${Math.round(cssScale * fallbackHeight)}px`;
 			wrapper.style.display = 'block';
 			// pdfjs TextLayer uses --total-scale-factor (= --scale-factor * --user-unit)
 			// to position/size text spans. We must set --scale-factor so the calc resolves.
-			wrapper.style.setProperty('--scale-factor', String(cssViewport.scale));
+			wrapper.style.setProperty('--scale-factor', String(cssScale));
 
 			if (i > 1) {
 				wrapper.style.marginTop = '4px';
 			}
-
-			// Create canvas
-			const canvas = document.createElement('canvas');
-			canvas.width = scaledViewport.width;
-			canvas.height = scaledViewport.height;
-			// CSS size stays at the CSS-pixel dimensions for layout
-			canvas.style.width = `${Math.round(cssScale * viewport.width)}px`;
-			canvas.style.height = `${Math.round(cssScale * viewport.height)}px`;
-			canvas.style.display = 'block';
-			wrapper.appendChild(canvas);
-
-			const ctx = canvas.getContext('2d');
-			if (!ctx) continue;
-
-			await page.render({
-				canvas,
-				canvasContext: ctx,
-				viewport: scaledViewport
-			}).promise;
-			if (token !== renderToken) return;
-
-			// Create text layer overlay — pdfjs setLayerDimensions handles its sizing
-			const textLayerDiv = document.createElement('div');
-			textLayerDiv.className = 'textLayer';
-			wrapper.appendChild(textLayerDiv);
-
-			const textContent = await page.getTextContent();
-			const textLayer = new pdfjs.TextLayer({
-				textContentSource: textContent,
-				container: textLayerDiv,
-				viewport: cssViewport
-			});
-			await textLayer.render();
-			if (token !== renderToken) return;
-			textLayerInstances.push(textLayer);
-
 			wrappers.push(wrapper);
 		}
 
 		sceneElement.replaceChildren(...wrappers);
 		lastRenderedZoom = 1;
-		renderedPage = singlePage ? selectedPage : 0;
+		renderedPage = 0;
 		initPanzoom();
+
+		watchPages();
+
+		// The requested page renders first (strict priority); only after it has
+		// been served does the queue continue with the ±2 neighbors etc.
 		await scrollToTargetPage();
-		syncVisiblePage();
+		if (token === renderToken) syncVisiblePage();
+
+		// Correct the placeholder sizes to the real page dimensions in the
+		// background — this never blocks rendering.
+		if (token === renderToken) void refinePageDimensions(token);
+	};
+
+	// Progressively fetch real page dimensions and correct the placeholder
+	// sizes (initially derived from the requested page).
+	const refinePageDimensions = async (token: number) => {
+		if (!pdfDoc) return;
+		const doc = pdfDoc;
+		const numPages = doc.numPages;
+		let next = 1;
+
+		const applyDims = (pageNumber: number, width: number, height: number) => {
+			if (!sceneElement || renderedPages.has(pageNumber)) return;
+			const wrapper = sceneElement.querySelector(
+				`.pdf-page-wrapper[data-page-number="${pageNumber}"]`
+			) as HTMLElement | null;
+			if (!wrapper) return;
+
+			const cssScale = getCssScale({ width, height });
+			const widthPx = Math.round(cssScale * width);
+			const heightPx = Math.round(cssScale * height);
+			if (wrapper.style.width !== `${widthPx}px`) wrapper.style.width = `${widthPx}px`;
+			if (wrapper.style.height !== `${heightPx}px`) wrapper.style.height = `${heightPx}px`;
+			wrapper.style.setProperty('--scale-factor', String(cssScale));
+		};
+
+		await Promise.all(
+			Array.from({ length: Math.min(32, numPages) }, async () => {
+				while (next <= numPages) {
+					if (token !== renderToken) return;
+					const pageNumber = next++;
+					try {
+						const page = await doc.getPage(pageNumber);
+						if (token !== renderToken) return;
+						const viewport = page.getViewport({ scale: 1 });
+						applyDims(pageNumber, viewport.width, viewport.height);
+					} catch {
+						// Keep the derived placeholder size for this page.
+					}
+				}
+			})
+		);
+	};
+
+	// Render canvas + text layer for one page into its placeholder wrapper.
+	const renderPageInto = async (pageNumber: number) => {
+		if (!pdfDoc || !sceneElement) return;
+		const token = renderToken;
+
+		const wrapper = sceneElement.querySelector(
+			`.pdf-page-wrapper[data-page-number="${pageNumber}"]`
+		) as HTMLElement | null;
+		if (!wrapper) return;
+
+		const pdfjs = await loadPdfJs();
+		if (token !== renderToken) return;
+		const dpr = window.devicePixelRatio || 1;
+
+		const page = await pdfDoc.getPage(pageNumber);
+		if (token !== renderToken) return;
+		const viewport = page.getViewport({ scale: 1 });
+
+		// Scale to fit container width
+		const cssScale = getCssScale(viewport);
+		const renderScale = cssScale * lastRenderedZoom * dpr;
+		const scaledViewport = page.getViewport({ scale: renderScale });
+		const cssViewport = page.getViewport({ scale: cssScale });
+
+		// Drop any previous content for this page (stale zoom or leftover render)
+		const existingTextLayer = textLayerByPage.get(pageNumber);
+		if (existingTextLayer) {
+			try {
+				existingTextLayer.cancel();
+			} catch {
+				// noop
+			}
+			textLayerByPage.delete(pageNumber);
+		}
+		wrapper.querySelector('canvas')?.remove();
+		wrapper.querySelector('.textLayer')?.remove();
+		// Correct the wrapper size to the real page dimensions (placeholders may
+		// still be derived from the requested page).
+		wrapper.style.width = `${Math.round(cssScale * viewport.width)}px`;
+		wrapper.style.height = `${Math.round(cssScale * viewport.height)}px`;
+		wrapper.style.setProperty('--scale-factor', String(cssViewport.scale));
+
+		// Create canvas
+		const canvas = document.createElement('canvas');
+		canvas.width = scaledViewport.width;
+		canvas.height = scaledViewport.height;
+		// CSS size stays at the CSS-pixel dimensions for layout
+		canvas.style.width = `${Math.round(cssScale * viewport.width)}px`;
+		canvas.style.height = `${Math.round(cssScale * viewport.height)}px`;
+		canvas.style.display = 'block';
+		wrapper.appendChild(canvas);
+
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return;
+
+		await page.render({
+			canvas,
+			canvasContext: ctx,
+			viewport: scaledViewport
+		}).promise;
+		if (token !== renderToken) return;
+
+		// Create text layer overlay — pdfjs setLayerDimensions handles its sizing
+		const textLayerDiv = document.createElement('div');
+		textLayerDiv.className = 'textLayer';
+		wrapper.appendChild(textLayerDiv);
+
+		const textContent = await page.getTextContent();
+		const textLayer = new pdfjs.TextLayer({
+			textContentSource: textContent,
+			container: textLayerDiv,
+			viewport: cssViewport
+		});
+		await textLayer.render();
+		if (token !== renderToken) return;
+		textLayerByPage.set(pageNumber, textLayer);
+
+		renderedPages.add(pageNumber);
+		pageRenderZoom.set(pageNumber, lastRenderedZoom);
+		if (priorityPage === pageNumber) priorityPage = null;
+
+		// Keep the page in the render cache so scrolling back is instant; LRU
+		// eviction frees it once it falls out of the cache.
+		touchRenderCache(pageNumber);
+		evictRenderCache();
+	};
+
+	// Remove canvas + text layer from a page wrapper, keeping the placeholder
+	// size intact. Keeps memory bounded while scrolling through large documents.
+	const unrenderPage = (pageNumber: number) => {
+		if (!sceneElement) return;
+		const wrapper = sceneElement.querySelector(
+			`.pdf-page-wrapper[data-page-number="${pageNumber}"]`
+		);
+		if (!wrapper) return;
+
+		const textLayer = textLayerByPage.get(pageNumber);
+		if (textLayer) {
+			try {
+				textLayer.cancel();
+			} catch {
+				// noop
+			}
+			textLayerByPage.delete(pageNumber);
+		}
+		wrapper.querySelector('canvas')?.remove();
+		wrapper.querySelector('.textLayer')?.remove();
+		renderedPages.delete(pageNumber);
+		pageRenderZoom.delete(pageNumber);
+	};
+
+	const runRenderQueue = async () => {
+		if (renderQueueRunning) return;
+		renderQueueRunning = true;
+		try {
+			while (renderQueue.length > 0) {
+				const pageNumber = renderQueue.shift()!;
+				if (!pdfDoc || !sceneElement) return;
+
+				// Strict priority: nothing else renders until the requested/visible
+				// page has been served.
+				if (priorityPage !== null && pageNumber !== priorityPage) {
+					renderQueue.push(pageNumber);
+					break;
+				}
+
+				// Already rendered at the current zoom? Nothing to do.
+				if (
+					renderedPages.has(pageNumber) &&
+					pageRenderZoom.get(pageNumber) === lastRenderedZoom
+				) {
+					continue;
+				}
+
+				// Off-screen and not explicitly requested: only mark stale, the page
+				// gets rendered once it comes near the viewport again.
+				if (!pagesInRenderRange.has(pageNumber) && !wantedPages.has(pageNumber)) {
+					unrenderPage(pageNumber);
+					continue;
+				}
+
+				try {
+					await renderPageInto(pageNumber);
+				} catch (e) {
+					console.error('PDF page render error:', e);
+					if (priorityPage === pageNumber) priorityPage = null;
+				}
+			}
+		} finally {
+			renderQueueRunning = false;
+		}
+	};
+
+	const enqueuePageRender = (pageNumber: number, priority = false) => {
+		if (singlePage) return;
+		if (
+			!priority &&
+			renderedPages.has(pageNumber) &&
+			pageRenderZoom.get(pageNumber) === lastRenderedZoom
+		) {
+			return;
+		}
+
+		const index = renderQueue.indexOf(pageNumber);
+		if (index !== -1) renderQueue.splice(index, 1);
+		if (priority) {
+			renderQueue.unshift(pageNumber);
+		} else {
+			renderQueue.push(pageNumber);
+		}
+		void runRenderQueue();
+	};
+
+	// Strict priority for the requested/visible page: render it first, then
+	// warm the two pages before and after it. While the priority page has not
+	// been served, the render queue does not touch anything else.
+	const setPriorityPage = (pageNumber: number) => {
+		if (singlePage || !pdfDoc) return;
+		const clamped = clampDocumentTargetPage(pageNumber, pdfDoc.numPages);
+		if (!clamped) return;
+
+		if (renderedPages.has(clamped) && pageRenderZoom.get(clamped) === lastRenderedZoom) {
+			priorityPage = null;
+		} else {
+			priorityPage = clamped;
+			enqueuePageRender(clamped, true);
+		}
+
+		for (const neighbor of [clamped - 2, clamped - 1, clamped + 1, clamped + 2]) {
+			if (neighbor >= 1 && neighbor <= pdfDoc.numPages) {
+				enqueuePageRender(neighbor);
+			}
+		}
+	};
+
+	// Render cache (LRU, oldest first): recently rendered pages stay alive so
+	// scrolling back is instant. Overflow frees the oldest page that is not
+	// currently needed.
+	const touchRenderCache = (pageNumber: number) => {
+		const index = renderCacheOrder.indexOf(pageNumber);
+		if (index !== -1) renderCacheOrder.splice(index, 1);
+		renderCacheOrder.push(pageNumber);
+	};
+
+	const evictRenderCache = () => {
+		if (renderCacheOrder.length <= maxRenderCachePages) return;
+
+		for (
+			let i = 0;
+			i < renderCacheOrder.length && renderCacheOrder.length > maxRenderCachePages;
+			i++
+		) {
+			const candidate = renderCacheOrder[i];
+			if (
+				wantedPages.has(candidate) ||
+				pagesInRenderRange.has(candidate) ||
+				candidate === priorityPage
+			) {
+				continue;
+			}
+			renderCacheOrder.splice(i, 1);
+			i--;
+			unrenderPage(candidate);
+		}
+	};
+
+	// Observe page placeholders: pages near the viewport get rendered, pages that
+	// scrolled out of the wider range have their canvas/text layer freed again.
+	const watchPages = () => {
+		if (!outerContainer || !sceneElement) return;
+		pageObserver?.disconnect();
+		farPageObserver?.disconnect();
+
+		pageObserver = new IntersectionObserver(
+			(entries) => {
+				for (const entry of entries) {
+					const pageNumber = Number((entry.target as HTMLElement).dataset.pageNumber);
+					if (!pageNumber) continue;
+
+					if (entry.isIntersecting) {
+						wantedPages.add(pageNumber);
+						touchRenderCache(pageNumber);
+						enqueuePageRender(pageNumber);
+					} else {
+						// Stay rendered (render cache) until LRU eviction frees it.
+						wantedPages.delete(pageNumber);
+					}
+				}
+			},
+			{ root: outerContainer, rootMargin: '100% 0px 100% 0px' }
+		);
+
+		farPageObserver = new IntersectionObserver(
+			(entries) => {
+				for (const entry of entries) {
+					const pageNumber = Number((entry.target as HTMLElement).dataset.pageNumber);
+					if (!pageNumber) continue;
+
+					if (entry.isIntersecting) {
+						pagesInRenderRange.add(pageNumber);
+					} else {
+						// Leave the page to the render cache; LRU eviction frees it.
+						pagesInRenderRange.delete(pageNumber);
+					}
+				}
+			},
+			{ root: outerContainer, rootMargin: '300% 0px 300% 0px' }
+		);
+
+		for (const wrapper of sceneElement.querySelectorAll('.pdf-page-wrapper')) {
+			pageObserver.observe(wrapper);
+			farPageObserver.observe(wrapper);
+		}
 	};
 
 	const handleWheel = (e: WheelEvent) => {
@@ -403,12 +748,14 @@
 		pageCount = 0;
 		pzInstance?.dispose();
 		cancelTextLayers();
+		pageObserver?.disconnect();
+		farPageObserver?.disconnect();
+		renderQueue = [];
 		pdfDoc?.destroy();
 		pdfDoc = null;
 
 		try {
-			const pdfjs = await import('pdfjs-dist');
-			pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+			const pdfjs = await loadPdfJs();
 
 			let pdfData: ArrayBuffer | Uint8Array;
 			if (data) {
@@ -419,12 +766,16 @@
 				if (!res.ok) throw new Error(`HTTP ${res.status}`);
 				pdfData = await res.arrayBuffer();
 			}
-			pdfDoc = await pdfjs.getDocument({ data: pdfData }).promise;
+			pdfDoc = await pdfjs.getDocument({ data: pdfData, ...PDF_DOCUMENT_OPTIONS }).promise;
 			if (token !== loadToken) return;
 			pageCount = pdfDoc.numPages;
 			activePage = clampDocumentTargetPage(targetPage, pageCount) ?? 1;
 			targetPage = clampDocumentTargetPage(targetPage, pageCount) ?? 1;
-			await renderAllPages();
+			if (singlePage) {
+				await renderAllPages();
+			} else {
+				await buildPagesStructure();
+			}
 		} catch (e) {
 			if (token === loadToken) {
 				console.error('PDF render error:', e);
@@ -459,6 +810,9 @@
 		if (rerenderTimer) clearTimeout(rerenderTimer);
 		pzInstance?.dispose();
 		cancelTextLayers();
+		pageObserver?.disconnect();
+		farPageObserver?.disconnect();
+		renderQueue = [];
 		if (pdfDoc) {
 			pdfDoc.destroy();
 			pdfDoc = null;
@@ -684,5 +1038,17 @@
 
 	:global(.textLayer.selecting .endOfContent) {
 		top: 0;
+	}
+
+	/*
+	 * Lazy-rendered page placeholders: empty page wrappers get a subtle
+	 * background so unrendered pages are still visible while scrolling fast.
+	 */
+	div :global(.pdf-page-wrapper) {
+		background-color: #f9fafb;
+	}
+
+	:global(.dark) div :global(.pdf-page-wrapper) {
+		background-color: rgb(17 24 39 / 0.35);
 	}
 </style>

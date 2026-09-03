@@ -1149,6 +1149,11 @@
 		} else if (type === 'terminal:write_file' || type === 'terminal:replace_file_content') {
 			if (!data?.path) return;
 			showFileNavDir.set(data.path);
+			// Invalidate the client-side file cache so the next display_file for
+			// this path fetches fresh content instead of a stale cached buffer.
+			import('$lib/utils/fileCache').then(({ invalidateFileBuffers }) =>
+				invalidateFileBuffers(data.path)
+			);
 		} else if (type === 'terminal:run_command') {
 			showFileNavDir.set('/');
 		}

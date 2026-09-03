@@ -5,6 +5,7 @@ import DOMPurify from 'dompurify';
 import { WEBUI_BASE_URL } from '$lib/constants';
 import type { FileNavOpenRequest } from '$lib/stores';
 import { normalizeDocumentTargetPage } from '$lib/utils/documentPreview';
+import { PDF_DOCUMENT_OPTIONS } from '$lib/utils/pdf';
 
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
@@ -1887,7 +1888,7 @@ export const extractContentFromFile = async (file: File) => {
 	async function extractPdfText(file: File) {
 		const pdfjsLib = await ensurePDFjsLoaded();
 		const arrayBuffer = await file.arrayBuffer();
-		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer, ...PDF_DOCUMENT_OPTIONS }).promise;
 		let allText = '';
 		for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
 			const page = await pdf.getPage(pageNum);

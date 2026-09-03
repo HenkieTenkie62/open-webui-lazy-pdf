@@ -543,6 +543,10 @@
 
 			if (['write_file'].includes(data?.name) && params?.path) {
 				showFileNavDir.set(result?.path ?? params.path);
+				// Invalidate the client-side file cache for this path
+				import('$lib/utils/fileCache').then(({ invalidateFileBuffers }) =>
+					invalidateFileBuffers(params.path)
+				);
 			}
 
 			if (cb) {

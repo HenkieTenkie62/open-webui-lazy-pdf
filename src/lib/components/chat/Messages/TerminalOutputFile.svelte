@@ -11,6 +11,7 @@
 		terminalServers
 	} from '$lib/stores';
 	import { downloadFileBlob, downloadFilePreview, readFile } from '$lib/apis/terminal';
+	import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/fileCache';
 	import FilePreview from '$lib/components/chat/FileNav/FilePreview.svelte';
 	import Icon from '$lib/components/chat/FileNav/Icon.svelte';
 	import { fileIconName } from '$lib/components/chat/FileNav/fileIcon';
@@ -146,10 +147,18 @@
 				const ext = getExt(path);
 
 				if (isPdf(path)) {
-					const result = await blobForPreview();
-					if (!result) throw new Error(t('Preview failed'));
-					const arrayBuffer = await result.blob.arrayBuffer();
-					filePdfData = arrayBuffer;
+					// Serve from the client-side file cache when available
+					const cacheKey = fileCacheKey(terminal?.url ?? '', path);
+					const cached = getCachedFileBuffer(cacheKey);
+					if (cached) {
+						filePdfData = cached;
+					} else {
+						const result = await blobForPreview();
+						if (!result) throw new Error(t('Preview failed'));
+						const arrayBuffer = await result.blob.arrayBuffer();
+						filePdfData = arrayBuffer;
+						if (terminal) storeFileBuffer(cacheKey, arrayBuffer);
+					}
 				} else if (isSqlite(path)) {
 					const result = await blobForPreview();
 					if (!result) throw new Error(t('Preview failed'));
@@ -164,6 +173,7 @@
 					);
 					if (preview) {
 						filePdfData = await preview.blob.arrayBuffer();
+						storeFileBuffer(fileCacheKey(terminal?.url ?? '', path, 'pdf-preview'), filePdfData);
 					} else {
 						const result = await blobForPreview();
 						if (!result) throw new Error(t('Preview failed'));
@@ -188,6 +198,7 @@
 					);
 					if (preview) {
 						filePdfData = await preview.blob.arrayBuffer();
+						storeFileBuffer(fileCacheKey(terminal?.url ?? '', path, 'pdf-preview'), filePdfData);
 					} else {
 						const result = await blobForPreview();
 						if (!result) throw new Error(t('Preview failed'));

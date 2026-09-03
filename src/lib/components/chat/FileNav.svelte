@@ -42,6 +42,7 @@
 	import { isSavedChatId, isTemporaryChatId } from '$lib/utils/chatId';
 	import { copyToClipboard } from '$lib/utils';
 	import { normalizeDocumentTargetPage } from '$lib/utils/documentPreview';
+import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/fileCache';
 
 	import Spinner from '../common/Spinner.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
@@ -852,13 +853,24 @@
 			);
 			if (result) fileAudioUrl = URL.createObjectURL(result.blob);
 		} else if (isPdf(filePath)) {
-			const result = await downloadFileBlob(
-				terminal.url,
-				terminal.key,
-				filePath,
-				chatId ?? undefined
-			);
-			if (result) filePdfData = await result.blob.arrayBuffer();
+			// Serve from the client-side file cache when available so reopening
+			// the same PDF does not re-download it from the terminal server.
+			const cacheKey = fileCacheKey(terminal.url, filePath);
+			const cached = getCachedFileBuffer(cacheKey);
+			if (cached) {
+				filePdfData = cached;
+			} else {
+				const result = await downloadFileBlob(
+					terminal.url,
+					terminal.key,
+					filePath,
+					chatId ?? undefined
+				);
+				if (result) {
+					filePdfData = await result.blob.arrayBuffer();
+					storeFileBuffer(cacheKey, filePdfData);
+				}
+			}
 		} else if (isSqlite(filePath)) {
 			const result = await downloadFileBlob(
 				terminal.url,
@@ -879,6 +891,7 @@
 					);
 					if (preview) {
 						filePdfData = await preview.blob.arrayBuffer();
+						storeFileBuffer(fileCacheKey(terminal.url, filePath, 'pdf-preview'), filePdfData);
 					} else {
 						const result = await downloadFileBlob(
 							terminal.url,
@@ -920,6 +933,7 @@
 					);
 					if (preview) {
 						filePdfData = await preview.blob.arrayBuffer();
+						storeFileBuffer(fileCacheKey(terminal.url, filePath, 'pdf-preview'), filePdfData);
 					} else {
 						const result = await downloadFileBlob(
 							terminal.url,
