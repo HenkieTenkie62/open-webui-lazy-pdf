@@ -182,6 +182,8 @@
 				} catch (e) {
 					console.warn('PDF thumbnail render error:', e);
 				}
+				// Don't starve the main thread while filling the sidebar.
+				await new Promise((resolve) => setTimeout(resolve));
 			}
 		} finally {
 			thumbQueueRunning = false;

@@ -78,6 +78,29 @@
 	const copyPdfData = (pdfData: ArrayBuffer | Uint8Array) =>
 		pdfData instanceof Uint8Array ? pdfData.slice() : pdfData.slice(0);
 
+	// Let the browser paint/interact between heavy render steps so the whole UI
+	// does not freeze while pages are being rasterized or text layers built.
+	const yieldFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+	// Keep the math-based scroll tracking (cumulative page offsets) in sync.
+	let pageCssHeights: number[] = [];
+	let pageCssOffsets: number[] = [];
+	let offsetsDirty = false;
+
+	const setPageCssHeight = (pageNumber: number, cssHeight: number) => {
+		pageCssHeights[pageNumber - 1] = cssHeight;
+		offsetsDirty = true;
+	};
+
+	const recomputeOffsets = () => {
+		let y = 0;
+		for (let i = 0; i < pageCssHeights.length; i++) {
+			pageCssOffsets[i] = y;
+			y += pageCssHeights[i] + (i > 0 ? 4 : 0);
+		}
+		offsetsDirty = false;
+	};
+
 	const cancelTextLayers = () => {
 		for (const tl of textLayerByPage.values()) {
 			try {
@@ -198,22 +221,53 @@
 		scrollFrame = null;
 		if (singlePage || !outerContainer || !sceneElement || !pdfDoc) return;
 
-		const marker = outerContainer.getBoundingClientRect().top + outerContainer.clientHeight * 0.35;
-		let bestPage = activePage;
-		let bestDistance = Number.POSITIVE_INFINITY;
+		const transform = pzInstance?.getTransform();
+		const atDefaultScale =
+			transform &&
+			Math.abs(transform.scale - 1) < 0.01 &&
+			Math.abs(transform.x) < 0.5 &&
+			Math.abs(transform.y) < 0.5;
 
-		for (const wrapper of sceneElement.querySelectorAll('.pdf-page-wrapper')) {
-			const el = wrapper as HTMLElement;
-			const page = Number(el.dataset.pageNumber);
-			if (!page) continue;
-
-			const rect = el.getBoundingClientRect();
-			const distance =
-				marker < rect.top ? rect.top - marker : marker > rect.bottom ? marker - rect.bottom : 0;
-			if (distance < bestDistance) {
-				bestDistance = distance;
-				bestPage = page;
+		let bestPage: number;
+		if (atDefaultScale && pageCssOffsets.length === pdfDoc.numPages) {
+			// Math path: binary search the cumulative offsets — no DOM reads, so
+			// scrolling a 900+ page document does not jank on ~querySelectorAll.
+			if (offsetsDirty) recomputeOffsets();
+			const markerY = outerContainer.scrollTop + outerContainer.clientHeight * 0.35;
+			let lo = 0;
+			let hi = pdfDoc.numPages - 1;
+			let ans = 0;
+			while (lo <= hi) {
+				const mid = (lo + hi) >> 1;
+				if (pageCssOffsets[mid] <= markerY) {
+					ans = mid;
+					lo = mid + 1;
+				} else {
+					hi = mid - 1;
+				}
 			}
+			bestPage = ans + 1;
+		} else {
+			// Fallback (zoomed/panned): measure the actual wrapper positions.
+			const marker =
+				outerContainer.getBoundingClientRect().top + outerContainer.clientHeight * 0.35;
+			let bestPage_ = activePage;
+			let bestDistance = Number.POSITIVE_INFINITY;
+
+			for (const wrapper of sceneElement.querySelectorAll('.pdf-page-wrapper')) {
+				const el = wrapper as HTMLElement;
+				const page = Number(el.dataset.pageNumber);
+				if (!page) continue;
+
+				const rect = el.getBoundingClientRect();
+				const distance =
+					marker < rect.top ? rect.top - marker : marker > rect.bottom ? marker - rect.bottom : 0;
+				if (distance < bestDistance) {
+					bestDistance = distance;
+					bestPage_ = page;
+				}
+			}
+			bestPage = bestPage_;
 		}
 
 		if (bestPage !== activePage) {
@@ -360,6 +414,12 @@
 			wrappers.push(wrapper);
 		}
 
+		// Seed the math-based scroll path with the placeholder sizes (refined
+		// progressively in refinePageDimensions + renderPageInto).
+		pageCssHeights = wrappers.map((w) => parseFloat(w.style.height) || 0);
+		pageCssOffsets = new Array(numPages);
+		recomputeOffsets();
+
 		sceneElement.replaceChildren(...wrappers);
 		lastRenderedZoom = 1;
 		renderedPage = 0;
@@ -396,7 +456,11 @@
 			const widthPx = Math.round(cssScale * width);
 			const heightPx = Math.round(cssScale * height);
 			if (wrapper.style.width !== `${widthPx}px`) wrapper.style.width = `${widthPx}px`;
-			if (wrapper.style.height !== `${heightPx}px`) wrapper.style.height = `${heightPx}px`;
+			if (wrapper.style.height !== `${heightPx}px`) {
+				wrapper.style.height = `${heightPx}px`;
+				pageCssHeights[pageNumber - 1] = heightPx;
+				offsetsDirty = true;
+			}
 			wrapper.style.setProperty('--scale-factor', String(cssScale));
 		};
 
@@ -418,6 +482,22 @@
 				}
 			})
 		);
+	};
+
+	// Persist a rendered page to the shared render cache, but only when the
+	// browser is idle — WebP-encoding a full-width page on the main thread
+	// right after it becomes visible would freeze the UI.
+	const deferStoreRender = (renderKey: string, pageNumber: number, canvas: HTMLCanvasElement) => {
+		const pagePrefix = `${cacheKey}|p${pageNumber}`;
+		if (typeof (window as Window & { requestIdleCallback?: unknown }).requestIdleCallback === 'function') {
+			(window as Window & {
+				requestIdleCallback: (cb: () => void, opts?: { timeout: number }) => number;
+			}).requestIdleCallback(() => void storeCachedRender(renderKey, pagePrefix, canvas), {
+				timeout: 4000
+			});
+		} else {
+			void storeCachedRender(renderKey, pagePrefix, canvas);
+		}
 	};
 
 	// Render canvas + text layer for one page into its placeholder wrapper.
@@ -460,6 +540,8 @@
 		// still be derived from the requested page).
 		wrapper.style.width = `${Math.round(cssScale * viewport.width)}px`;
 		wrapper.style.height = `${Math.round(cssScale * viewport.height)}px`;
+		pageCssHeights[pageNumber - 1] = cssScale * viewport.height;
+		offsetsDirty = true;
 		wrapper.style.setProperty('--scale-factor', String(cssViewport.scale));
 
 		// Create canvas
@@ -474,6 +556,8 @@
 
 		const ctx = canvas.getContext('2d');
 		if (!ctx) return;
+		await yieldFrame();
+		if (token !== renderToken) return;
 
 		// Reuse a previously rasterized page (shared render cache + IndexedDB)
 		// when available, so a NEW viewer element for the same file shows the
@@ -487,16 +571,26 @@
 		if (cachedBitmap) {
 			canvas.width = scaledViewport.width;
 			canvas.height = scaledViewport.height;
+			await yieldFrame();
+			if (token !== renderToken) return;
 			ctx.drawImage(cachedBitmap, 0, 0, canvas.width, canvas.height);
+			await yieldFrame();
+			if (token !== renderToken) return;
 		} else {
+			await yieldFrame();
+			if (token !== renderToken) return;
 			await page.render({
 				canvas,
 				canvasContext: ctx,
 				viewport: scaledViewport
 			}).promise;
 			if (token !== renderToken) return;
+			await yieldFrame();
+			if (token !== renderToken) return;
 			if (renderKey) {
-				void storeCachedRender(renderKey, `${cacheKey}|p${pageNumber}`, canvas);
+				// Persist the raster outside the render path so the encode never
+				// blocks the UI right after a page becomes visible.
+				deferStoreRender(renderKey, pageNumber, canvas);
 			}
 		}
 		if (token !== renderToken) return;
@@ -582,6 +676,10 @@
 					console.warn('PDF page render error:', e);
 					if (priorityPage === pageNumber) priorityPage = null;
 				}
+
+				// Let the UI paint/respond between pages.
+				await yieldFrame();
+				if (!pdfDoc || !sceneElement) return;
 			}
 		} finally {
 			renderQueueRunning = false;
