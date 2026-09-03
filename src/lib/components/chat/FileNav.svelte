@@ -42,7 +42,7 @@
 	import { isSavedChatId, isTemporaryChatId } from '$lib/utils/chatId';
 	import { copyToClipboard } from '$lib/utils';
 	import { normalizeDocumentTargetPage } from '$lib/utils/documentPreview';
-import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/fileCache';
+import { fileCacheKey, loadCachedFileBuffer, storeFileBuffer, rememberFileKey } from '$lib/utils/fileCache';
 
 	import Spinner from '../common/Spinner.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
@@ -853,12 +853,13 @@ import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/f
 			);
 			if (result) fileAudioUrl = URL.createObjectURL(result.blob);
 		} else if (isPdf(filePath)) {
-			// Serve from the client-side file cache when available so reopening
-			// the same PDF does not re-download it from the terminal server.
+			// Serve from the client-side file cache (memory + IndexedDB) when
+			// available so reopening the same PDF does not re-download it.
 			const cacheKey = fileCacheKey(terminal.url, filePath);
-			const cached = getCachedFileBuffer(cacheKey);
+			const cached = await loadCachedFileBuffer(cacheKey);
 			if (cached) {
 				filePdfData = cached;
+				rememberFileKey(cached, cacheKey);
 			} else {
 				const result = await downloadFileBlob(
 					terminal.url,
@@ -868,7 +869,8 @@ import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/f
 				);
 				if (result) {
 					filePdfData = await result.blob.arrayBuffer();
-					storeFileBuffer(cacheKey, filePdfData);
+					rememberFileKey(filePdfData, cacheKey);
+					void storeFileBuffer(cacheKey, filePdfData);
 				}
 			}
 		} else if (isSqlite(filePath)) {
@@ -891,7 +893,8 @@ import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/f
 					);
 					if (preview) {
 						filePdfData = await preview.blob.arrayBuffer();
-						storeFileBuffer(fileCacheKey(terminal.url, filePath, 'pdf-preview'), filePdfData);
+						rememberFileKey(filePdfData, fileCacheKey(terminal.url, filePath, 'pdf-preview'));
+						void storeFileBuffer(fileCacheKey(terminal.url, filePath, 'pdf-preview'), filePdfData);
 					} else {
 						const result = await downloadFileBlob(
 							terminal.url,
@@ -933,7 +936,8 @@ import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/f
 					);
 					if (preview) {
 						filePdfData = await preview.blob.arrayBuffer();
-						storeFileBuffer(fileCacheKey(terminal.url, filePath, 'pdf-preview'), filePdfData);
+						rememberFileKey(filePdfData, fileCacheKey(terminal.url, filePath, 'pdf-preview'));
+						void storeFileBuffer(fileCacheKey(terminal.url, filePath, 'pdf-preview'), filePdfData);
 					} else {
 						const result = await downloadFileBlob(
 							terminal.url,
@@ -1789,6 +1793,7 @@ import { fileCacheKey, getCachedFileBuffer, storeFileBuffer } from '$lib/utils/f
 					{fileOfficeHtml}
 					{fileOfficeSlides}
 					targetPage={documentTargetPage}
+					cacheKey={selectedTerminal && selectedFile ? fileCacheKey(selectedTerminal.url, selectedFile) : ''}
 					{excelSheetNames}
 					{selectedExcelSheet}
 					searchTarget={fileSearchTarget}

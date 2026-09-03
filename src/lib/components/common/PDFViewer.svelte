@@ -2,7 +2,14 @@
 	import { onMount, onDestroy, tick } from 'svelte';
 	import panzoom, { type PanZoom } from 'panzoom';
 	import { clampDocumentTargetPage } from '$lib/utils/documentPreview';
-	import { loadPdfJs, PDF_DOCUMENT_OPTIONS } from '$lib/utils/pdf';
+	import {
+		loadPdfJs,
+		PDF_DOCUMENT_OPTIONS,
+		acquirePdfDocument,
+		renderCacheKey,
+		loadCachedRender,
+		storeCachedRender
+	} from '$lib/utils/pdf';
 	import Spinner from './Spinner.svelte';
 
 	export let url: string | null = null;
@@ -12,6 +19,8 @@
 	export let singlePage = false;
 	export let itemLabel = 'Page';
 	export let onPageChange: ((page: number) => void) | null = null;
+	/** Stable key for the current file — enables shared doc + render caches. */
+	export let cacheKey = '';
 
 	type PdfDocument = import('pdfjs-dist').PDFDocumentProxy;
 	type PdfTextLayer = InstanceType<typeof import('pdfjs-dist').TextLayer>;
@@ -56,6 +65,7 @@
 	let pageRenderZoom: Map<number, number> = new Map();
 	let renderQueue: number[] = [];
 	let renderQueueRunning = false;
+	let releaseDoc: (() => void) | null = null;
 	// Strict priority: while set, only this page is rendered — everything else
 	// stays queued until the requested/visible page has been served.
 	let priorityPage: number | null = null;
@@ -391,10 +401,12 @@
 		};
 
 		await Promise.all(
-			Array.from({ length: Math.min(32, numPages) }, async () => {
+			Array.from({ length: Math.min(4, numPages) }, async () => {
 				while (next <= numPages) {
 					if (token !== renderToken) return;
 					const pageNumber = next++;
+					// Pages that are (about to be) rendered set their own size.
+					if (wantedPages.has(pageNumber)) continue;
 					try {
 						const page = await doc.getPage(pageNumber);
 						if (token !== renderToken) return;
@@ -463,11 +475,30 @@
 		const ctx = canvas.getContext('2d');
 		if (!ctx) return;
 
-		await page.render({
-			canvas,
-			canvasContext: ctx,
-			viewport: scaledViewport
-		}).promise;
+		// Reuse a previously rasterized page (shared render cache + IndexedDB)
+		// when available, so a NEW viewer element for the same file shows the
+		// page instantly instead of re-rendering from the pdf.js worker.
+		const renderKey = cacheKey
+			? renderCacheKey(cacheKey, pageNumber, lastRenderedZoom, dpr, cssScale)
+			: '';
+		const cachedBitmap = renderKey ? await loadCachedRender(renderKey) : null;
+		if (token !== renderToken) return;
+
+		if (cachedBitmap) {
+			canvas.width = scaledViewport.width;
+			canvas.height = scaledViewport.height;
+			ctx.drawImage(cachedBitmap, 0, 0, canvas.width, canvas.height);
+		} else {
+			await page.render({
+				canvas,
+				canvasContext: ctx,
+				viewport: scaledViewport
+			}).promise;
+			if (token !== renderToken) return;
+			if (renderKey) {
+				void storeCachedRender(renderKey, `${cacheKey}|p${pageNumber}`, canvas);
+			}
+		}
 		if (token !== renderToken) return;
 
 		// Create text layer overlay — pdfjs setLayerDimensions handles its sizing
@@ -542,17 +573,13 @@
 					continue;
 				}
 
-				// Off-screen and not explicitly requested: only mark stale, the page
-				// gets rendered once it comes near the viewport again.
-				if (!pagesInRenderRange.has(pageNumber) && !wantedPages.has(pageNumber)) {
-					unrenderPage(pageNumber);
-					continue;
-				}
-
 				try {
 					await renderPageInto(pageNumber);
 				} catch (e) {
-					console.error('PDF page render error:', e);
+					// console.warn is NOT stripped in production builds (only
+					// console.log/debug/error are via esbuild.pure) — render
+					// failures stay visible in the console.
+					console.warn('PDF page render error:', e);
 					if (priorityPage === pageNumber) priorityPage = null;
 				}
 			}
@@ -751,7 +778,12 @@
 		pageObserver?.disconnect();
 		farPageObserver?.disconnect();
 		renderQueue = [];
-		pdfDoc?.destroy();
+		if (releaseDoc) {
+			releaseDoc();
+			releaseDoc = null;
+		} else {
+			pdfDoc?.destroy();
+		}
 		pdfDoc = null;
 
 		try {
@@ -766,7 +798,22 @@
 				if (!res.ok) throw new Error(`HTTP ${res.status}`);
 				pdfData = await res.arrayBuffer();
 			}
-			pdfDoc = await pdfjs.getDocument({ data: pdfData, ...PDF_DOCUMENT_OPTIONS }).promise;
+			if (cacheKey) {
+				// Reuse the shared parsed document across viewer elements so the
+				// expensive parse of a 900+ page file happens at most once.
+				const { doc, release } = await acquirePdfDocument(
+					`doc:${cacheKey}`,
+					() => pdfjs.getDocument({ data: pdfData, ...PDF_DOCUMENT_OPTIONS }).promise
+				);
+				if (token !== loadToken) {
+					release();
+					return;
+				}
+				pdfDoc = doc;
+				releaseDoc = release;
+			} else {
+				pdfDoc = await pdfjs.getDocument({ data: pdfData, ...PDF_DOCUMENT_OPTIONS }).promise;
+			}
 			if (token !== loadToken) return;
 			pageCount = pdfDoc.numPages;
 			activePage = clampDocumentTargetPage(targetPage, pageCount) ?? 1;
@@ -778,7 +825,7 @@
 			}
 		} catch (e) {
 			if (token === loadToken) {
-				console.error('PDF render error:', e);
+				console.warn('PDF render error:', e);
 				error = 'Failed to load PDF.';
 			}
 		} finally {
@@ -813,10 +860,13 @@
 		pageObserver?.disconnect();
 		farPageObserver?.disconnect();
 		renderQueue = [];
-		if (pdfDoc) {
-			pdfDoc.destroy();
-			pdfDoc = null;
+		if (releaseDoc) {
+			releaseDoc();
+			releaseDoc = null;
+		} else {
+			pdfDoc?.destroy();
 		}
+		pdfDoc = null;
 	});
 </script>
 

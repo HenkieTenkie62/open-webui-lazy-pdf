@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
-	import { loadPdfJs, PDF_DOCUMENT_OPTIONS } from '$lib/utils/pdf';
+	import { loadPdfJs, PDF_DOCUMENT_OPTIONS, acquirePdfDocument } from '$lib/utils/pdf';
+	import { findFileKey } from '$lib/utils/fileCache';
 	import Spinner from './Spinner.svelte';
 	import PDFViewer from './PDFViewer.svelte';
 
@@ -11,6 +12,8 @@
 	export let singlePage = false;
 	export let itemLabel = 'Page';
 	export let listLabel = 'Pages';
+	/** Stable key derived from the file-cache key (shared doc + render caches). */
+	export let cacheKey: string | null = null;
 
 	type PdfDocument = import('pdfjs-dist').PDFDocumentProxy;
 
@@ -26,6 +29,8 @@
 	let pdfDoc: PdfDocument | null = null;
 	let loadToken = 0;
 	let asideEl: HTMLElement;
+	let resolvedCacheKey = '';
+	let releaseThumbDoc: (() => void) | null = null;
 
 	// Lazy thumbnail rendering: placeholder entries are listed immediately and
 	// actual thumbnails are rendered only when they scroll near the visible part
@@ -79,8 +84,30 @@
 		try {
 			const pdfjs = await loadPdfJs();
 
-			pdfDoc?.destroy();
-			pdfDoc = await pdfjs.getDocument({ data: pdfData, ...PDF_DOCUMENT_OPTIONS }).promise;
+			if (releaseThumbDoc) {
+				releaseThumbDoc();
+				releaseThumbDoc = null;
+			} else {
+				pdfDoc?.destroy();
+			}
+			pdfDoc = null;
+
+			if (resolvedCacheKey) {
+				// Reuse the shared parsed document so thumbnails and viewer do not
+				// both parse the same 900+ page file.
+				const { doc, release } = await acquirePdfDocument(
+					`doc:${resolvedCacheKey}`,
+					() => pdfjs.getDocument({ data: pdfData, ...PDF_DOCUMENT_OPTIONS }).promise
+				);
+				if (token !== loadToken) {
+					release();
+					return;
+				}
+				pdfDoc = doc;
+				releaseThumbDoc = release;
+			} else {
+				pdfDoc = await pdfjs.getDocument({ data: pdfData, ...PDF_DOCUMENT_OPTIONS }).promise;
+			}
 			if (token !== loadToken) return;
 
 			// Placeholder entries only — the actual thumbnails are rendered lazily
@@ -93,7 +120,7 @@
 
 			watchThumbnails();
 		} catch (e) {
-			console.error('PDF thumbnail render error:', e);
+			console.warn('PDF thumbnail render error:', e);
 			if (token === loadToken) thumbnails = [];
 		} finally {
 			if (token === loadToken) thumbsLoading = false;
@@ -153,7 +180,7 @@
 				try {
 					await renderThumbnail(index);
 				} catch (e) {
-					console.error('PDF thumbnail render error:', e);
+					console.warn('PDF thumbnail render error:', e);
 				}
 			}
 		} finally {
@@ -176,10 +203,12 @@
 
 	$: if (data) {
 		viewerData = copyPdfData(data);
+		resolvedCacheKey = (cacheKey ?? findFileKey(data)) || '';
 		void loadThumbnails(copyPdfData(data));
 	} else {
 		viewerData = null;
 		thumbnails = [];
+		resolvedCacheKey = '';
 	}
 
 	$: if (targetPage) {
@@ -214,7 +243,12 @@
 		resizeObserver?.disconnect();
 		thumbsObserver?.disconnect();
 		thumbQueue = [];
-		pdfDoc?.destroy();
+		if (releaseThumbDoc) {
+			releaseThumbDoc();
+			releaseThumbDoc = null;
+		} else {
+			pdfDoc?.destroy();
+		}
 	});
 </script>
 
@@ -278,6 +312,7 @@
 			<PDFViewer
 				bind:this={pdfViewerRef}
 				data={viewerData}
+				cacheKey={resolvedCacheKey}
 				targetPage={pageTarget}
 				{singlePage}
 				{itemLabel}

@@ -40,6 +40,7 @@
 	export let fileOfficeSlides: string[] | null = null;
 	export let currentSlide = 0;
 	export let targetPage: number | null = null;
+	export let cacheKey = '';
 	export let excelSheetNames: string[] = [];
 	export let selectedExcelSheet = '';
 	export let onSheetChange: ((sheet: string) => void) | null = null;
@@ -326,6 +327,7 @@
 		<PdfPagesPreview
 			bind:this={pdfPagesPreviewRef}
 			data={filePdfData}
+			cacheKey={cacheKey}
 			bind:currentSlide
 			{targetPage}
 			singlePage={isPptx}
