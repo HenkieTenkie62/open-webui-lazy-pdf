@@ -94,7 +94,12 @@
 
 	// Let the browser paint/interact between heavy render steps so the whole UI
 	// does not freeze while pages are being rasterized or text layers built.
-	const yieldFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+	// Uses setTimeout(0) instead of requestAnimationFrame because rAF is tied to
+	// the paint cycle and gets progressively slower as the browser gets busier
+	// with Svelte's reactive updates (observed: 16ms → 500ms → 800ms per rAF
+	// on consecutive display_file calls, causing 20s+ "queue drained" times).
+	// setTimeout(0) yields to the event loop without waiting for a paint.
+	const yieldFrame = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 	// Actively cancel the current page render (canvas + text layer) so a newly
 	// opened display_file gets the full worker instead of waiting behind old jobs.
@@ -619,8 +624,6 @@
 
 		const ctx = canvas.getContext('2d');
 		if (!ctx) return;
-		await yieldFrame();
-		if (token !== renderToken) return;
 
 		// Reuse a previously rasterized page (shared render cache + IndexedDB)
 		// when available, so a NEW viewer element for the same file shows the
@@ -635,11 +638,7 @@
 		if (cachedBitmap) {
 			canvas.width = scaledViewport.width;
 			canvas.height = scaledViewport.height;
-			await yieldFrame();
-			if (token !== renderToken) return;
 			ctx.drawImage(cachedBitmap, 0, 0, canvas.width, canvas.height);
-			await yieldFrame();
-			if (token !== renderToken) return;
 			console.warn(`[PDF] page ${pageNumber} cache hit in ${Date.now() - cacheStart}ms`);
 		} else {
 			console.warn(`[PDF] page ${pageNumber} cache MISS (key=${renderKey?.slice(-30)})`);
@@ -750,8 +749,6 @@
 		// page is too expensive (each rAF can take 100-500ms when the browser
 		// is busy painting/layouting) and causes the "queue drained" time to
 		// far exceed the actual render time.
-		let pagesSinceYield = 0;
-		const YIELD_EVERY = 2;
 		try {
 			while (renderQueue.length > 0) {
 				const pageNumber = renderQueue.shift()!;
@@ -792,12 +789,6 @@
 					if (priorityPage === pageNumber) priorityPage = null;
 				}
 
-				// Let the UI paint/respond periodically (not every page).
-				pagesSinceYield++;
-				if (pagesSinceYield >= YIELD_EVERY) {
-					pagesSinceYield = 0;
-					await yieldFrame();
-				}
 				if (!pdfDoc || !sceneElement) return;
 			}
 		} finally {
