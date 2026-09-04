@@ -792,7 +792,7 @@
 			}
 		} finally {
 			renderQueueRunning = false;
-			ioSuspended = false;
+			// ioSuspended stays true if new pages are added below;
 			// Enqueue pages that became visible while the queue was draining.
 			// They were collected in pendingIOPages; only those still wanted
 			// (i.e., still near the viewport) are enqueued. Push directly to
@@ -801,16 +801,20 @@
 			// runRenderQueue call and overflow the stack.
 			if (pendingIOPages.size > 0) {
 				for (const page of pendingIOPages) {
-					if (wantedPages.has(page) && !renderQueue.includes(page)) {
+					if (wantedPages.has(page) && !renderQueue.includes(page) && !renderedPages.has(page)) {
 						renderQueue.push(page);
 					}
 				}
 				pendingIOPages.clear();
-				if (renderQueue.length > 0) {
-					void runRenderQueue();
-				}
 			}
 			console.warn(`[PDF] queue drained in ${Date.now() - queueStart}ms`);
+			if (renderQueue.length > 0) {
+				// New pages to render — keep ioSuspended true and start a new run
+				void runRenderQueue();
+			} else {
+				// Queue truly empty — re-enable IO
+				ioSuspended = false;
+			}
 		}
 	};
 
@@ -831,7 +835,12 @@
 		} else {
 			renderQueue.push(pageNumber);
 		}
-		void runRenderQueue();
+		// If the queue is already draining, don't start a new run — the
+		// current run will pick up the newly queued page. Starting a new
+		// run here would cause parallel runs and stack overflow.
+		if (!renderQueueRunning) {
+			void runRenderQueue();
+		}
 	};
 
 	// Strict priority for the requested/visible page: render it first, then
@@ -903,7 +912,7 @@
 					if (entry.isIntersecting) {
 						wantedPages.add(pageNumber);
 						touchRenderCache(pageNumber);
-						if (ioSuspended) {
+						if (renderQueueRunning) {
 							pendingIOPages.add(pageNumber);
 						} else {
 							enqueuePageRender(pageNumber);
@@ -911,7 +920,7 @@
 					} else {
 						// Stay rendered (render cache) until LRU eviction frees it.
 						wantedPages.delete(pageNumber);
-						if (ioSuspended) {
+						if (renderQueueRunning) {
 							pendingIOPages.delete(pageNumber);
 						}
 					}
