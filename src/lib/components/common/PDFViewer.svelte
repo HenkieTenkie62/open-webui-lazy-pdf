@@ -620,6 +620,7 @@
 		const renderKey = cacheKey
 			? renderCacheKey(cacheKey, pageNumber, lastRenderedZoom, dpr, cssScale)
 			: '';
+		const cacheStart = Date.now();
 		const cachedBitmap = renderKey ? await loadCachedRender(renderKey) : null;
 		if (token !== renderToken) return;
 
@@ -631,7 +632,9 @@
 			ctx.drawImage(cachedBitmap, 0, 0, canvas.width, canvas.height);
 			await yieldFrame();
 			if (token !== renderToken) return;
+			console.warn(`[PDF] page ${pageNumber} cache hit in ${Date.now() - cacheStart}ms`);
 		} else {
+			console.warn(`[PDF] page ${pageNumber} cache MISS (key=${renderKey?.slice(-30)})`);
 			await yieldFrame();
 			if (token !== renderToken) return;
 			const task = page.render({
@@ -640,6 +643,7 @@
 				viewport: scaledViewport
 			});
 			activeRenderTask = task;
+			const renderStart = Date.now();
 			try {
 				await task.promise;
 			} catch (error) {
@@ -652,6 +656,7 @@
 			} finally {
 				if (activeRenderTask === task) activeRenderTask = null;
 			}
+			console.warn(`[PDF] page ${pageNumber} rendered in ${Date.now() - renderStart}ms`);
 			if (token !== renderToken) return;
 			await yieldFrame();
 			if (token !== renderToken) return;
@@ -726,6 +731,8 @@
 	const runRenderQueue = async () => {
 		if (renderQueueRunning) return;
 		renderQueueRunning = true;
+		const queueStart = Date.now();
+		console.warn(`[PDF] queue starting, depth=${renderQueue.length}`);
 		try {
 			while (renderQueue.length > 0) {
 				const pageNumber = renderQueue.shift()!;
@@ -772,6 +779,7 @@
 			}
 		} finally {
 			renderQueueRunning = false;
+			console.warn(`[PDF] queue drained in ${Date.now() - queueStart}ms`);
 		}
 	};
 
