@@ -66,6 +66,14 @@
 	let renderQueue: number[] = [];
 	let renderQueueRunning = false;
 	let releaseDoc: (() => void) | null = null;
+	// Tracks the in-flight pdf.js render/text-layer task so switching documents can
+	// actively cancel them and free the shared pdf.js worker for the new file.
+	let activeRenderTask: { cancel: () => void } | null = null;
+	let activeTextLayerTask: { cancel: () => void } | null = null;
+	let renderCancelRequested = false;
+	// Idle-time bitmap encodes still pending for this viewer session.
+	let pendingEncodes = new Set<string>();
+	let loadedCacheKey = '';
 	// Strict priority: while set, only this page is rendered — everything else
 	// stays queued until the requested/visible page has been served.
 	let priorityPage: number | null = null;
@@ -81,6 +89,28 @@
 	// Let the browser paint/interact between heavy render steps so the whole UI
 	// does not freeze while pages are being rasterized or text layers built.
 	const yieldFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+	// Actively cancel the current page render (canvas + text layer) so a newly
+	// opened display_file gets the full worker instead of waiting behind old jobs.
+	const cancelActiveRender = () => {
+		renderCancelRequested = true;
+		if (activeRenderTask) {
+			try {
+				activeRenderTask.cancel();
+			} catch {
+				// already finished/failed
+			}
+			activeRenderTask = null;
+		}
+		if (activeTextLayerTask) {
+			try {
+				activeTextLayerTask.cancel();
+			} catch {
+				// noop
+			}
+			activeTextLayerTask = null;
+		}
+	};
 
 	// Keep the math-based scroll tracking (cumulative page offsets) in sync.
 	let pageCssHeights: number[] = [];
@@ -489,14 +519,26 @@
 	// right after it becomes visible would freeze the UI.
 	const deferStoreRender = (renderKey: string, pageNumber: number, canvas: HTMLCanvasElement) => {
 		const pagePrefix = `${cacheKey}|p${pageNumber}`;
-		if (typeof (window as Window & { requestIdleCallback?: unknown }).requestIdleCallback === 'function') {
+		// Limit how many encodes can be pending at once and never let encodes from
+		// a document the user has moved away from block the main thread.
+		if (pendingEncodes.size >= 4) return;
+		const fileKey = cacheKey;
+		pendingEncodes.add(renderKey);
+		const run = () => {
+			pendingEncodes.delete(renderKey);
+			// The viewer now shows a DIFFERENT file: drop the stale encode.
+			if (!cacheKey || fileKey !== cacheKey) return;
+			void storeCachedRender(renderKey, pagePrefix, canvas);
+		};
+		if (
+			typeof (window as Window & { requestIdleCallback?: unknown }).requestIdleCallback ===
+			'function'
+		) {
 			(window as Window & {
 				requestIdleCallback: (cb: () => void, opts?: { timeout: number }) => number;
-			}).requestIdleCallback(() => void storeCachedRender(renderKey, pagePrefix, canvas), {
-				timeout: 4000
-			});
+			}).requestIdleCallback(run, { timeout: 5000 });
 		} else {
-			void storeCachedRender(renderKey, pagePrefix, canvas);
+			setTimeout(run, 1500);
 		}
 	};
 
@@ -579,11 +621,24 @@
 		} else {
 			await yieldFrame();
 			if (token !== renderToken) return;
-			await page.render({
+			const task = page.render({
 				canvas,
 				canvasContext: ctx,
 				viewport: scaledViewport
-			}).promise;
+			});
+			activeRenderTask = task;
+			try {
+				await task.promise;
+			} catch (error) {
+				if (renderCancelRequested) {
+					// Canceled because a new document was opened — swallow silently.
+					renderCancelRequested = false;
+					return;
+				}
+				throw error;
+			} finally {
+				if (activeRenderTask === task) activeRenderTask = null;
+			}
 			if (token !== renderToken) return;
 			await yieldFrame();
 			if (token !== renderToken) return;
@@ -606,7 +661,18 @@
 			container: textLayerDiv,
 			viewport: cssViewport
 		});
-		await textLayer.render();
+		activeTextLayerTask = textLayer;
+		try {
+			await textLayer.render();
+		} catch (error) {
+			if (renderCancelRequested) {
+				renderCancelRequested = false;
+				return;
+			}
+			throw error;
+		} finally {
+			if (activeTextLayerTask === textLayer) activeTextLayerTask = null;
+		}
 		if (token !== renderToken) return;
 		textLayerByPage.set(pageNumber, textLayer);
 
@@ -652,6 +718,12 @@
 				const pageNumber = renderQueue.shift()!;
 				if (!pdfDoc || !sceneElement) return;
 
+				// Abort promptly while another (newer) document is being loaded.
+				if (renderCancelRequested) {
+					renderCancelRequested = false;
+					return;
+				}
+
 				// Strict priority: nothing else renders until the requested/visible
 				// page has been served.
 				if (priorityPage !== null && pageNumber !== priorityPage) {
@@ -670,6 +742,10 @@
 				try {
 					await renderPageInto(pageNumber);
 				} catch (e) {
+					if (renderCancelRequested) {
+						renderCancelRequested = false;
+						return;
+					}
 					// console.warn is NOT stripped in production builds (only
 					// console.log/debug/error are via esbuild.pure) — render
 					// failures stay visible in the console.
@@ -864,6 +940,9 @@
 		if (!url && !data) return;
 
 		const source = data ?? url;
+		// Same file requested again — the document + page bitmaps are already
+		// loaded and shared, so a new display_file for the same path is instant.
+		if (cacheKey && pdfDoc && loadedCacheKey === cacheKey) return;
 		if (source === loadedSource && pdfDoc) return;
 		const token = ++loadToken;
 		loadedSource = source;
@@ -876,6 +955,13 @@
 		pageObserver?.disconnect();
 		farPageObserver?.disconnect();
 		renderQueue = [];
+		// Cancel the in-flight page render from the previous file so the shared
+		// pdf.js worker is free for the new document immediately.
+		cancelActiveRender();
+		renderToken++;
+		renderCancelRequested = false;
+		pendingEncodes.clear();
+		loadedCacheKey = cacheKey;
 		if (releaseDoc) {
 			releaseDoc();
 			releaseDoc = null;
@@ -958,6 +1044,9 @@
 		pageObserver?.disconnect();
 		farPageObserver?.disconnect();
 		renderQueue = [];
+		cancelActiveRender();
+		renderCancelRequested = false;
+		pendingEncodes.clear();
 		if (releaseDoc) {
 			releaseDoc();
 			releaseDoc = null;

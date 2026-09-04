@@ -151,11 +151,12 @@
 	};
 
 	const renderThumbnail = async (index: number) => {
-		if (!pdfDoc || thumbnails[index]) return;
+		const doc = pdfDoc;
+		if (!doc || thumbnails[index]) return;
 		const token = loadToken;
 
-		const page = await pdfDoc.getPage(index + 1);
-		if (token !== loadToken) return;
+		const page = await doc.getPage(index + 1);
+		if (token !== loadToken || doc !== pdfDoc) return;
 		const viewport = page.getViewport({ scale: 0.28 });
 		const canvas = document.createElement('canvas');
 		canvas.width = viewport.width;
@@ -165,7 +166,7 @@
 		if (!ctx) return;
 
 		await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-		if (token !== loadToken) return;
+		if (token !== loadToken || doc !== pdfDoc) return;
 
 		thumbnails[index] = canvas.toDataURL('image/png');
 		thumbnails = thumbnails;
