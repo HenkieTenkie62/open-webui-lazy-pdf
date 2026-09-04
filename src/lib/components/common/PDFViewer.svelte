@@ -746,6 +746,12 @@
 		ioSuspended = true;
 		const queueStart = Date.now();
 		console.warn(`[PDF] queue starting, depth=${renderQueue.length}`);
+		// Yield every N pages to let the UI breathe — yielding after every
+		// page is too expensive (each rAF can take 100-500ms when the browser
+		// is busy painting/layouting) and causes the "queue drained" time to
+		// far exceed the actual render time.
+		let pagesSinceYield = 0;
+		const YIELD_EVERY = 2;
 		try {
 			while (renderQueue.length > 0) {
 				const pageNumber = renderQueue.shift()!;
@@ -786,8 +792,12 @@
 					if (priorityPage === pageNumber) priorityPage = null;
 				}
 
-				// Let the UI paint/respond between pages.
-				await yieldFrame();
+				// Let the UI paint/respond periodically (not every page).
+				pagesSinceYield++;
+				if (pagesSinceYield >= YIELD_EVERY) {
+					pagesSinceYield = 0;
+					await yieldFrame();
+				}
 				if (!pdfDoc || !sceneElement) return;
 			}
 		} finally {
