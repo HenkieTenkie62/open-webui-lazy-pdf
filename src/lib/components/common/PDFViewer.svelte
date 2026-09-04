@@ -7,6 +7,7 @@
 		PDF_DOCUMENT_OPTIONS,
 		acquirePdfDocument,
 		renderCacheKey,
+		peekCachedRender,
 		loadCachedRender,
 		storeCachedRender
 	} from '$lib/utils/pdf';
@@ -75,7 +76,8 @@
 	// Tracks the in-flight pdf.js render/text-layer task so switching documents can
 	// actively cancel them and free the shared pdf.js worker for the new file.
 	let activeRenderTask: { cancel: () => void } | null = null;
-	let activeTextLayerTask: { cancel: () => void } | null = null;
+	// Text layers are built fire-and-forget, so several can be in flight at once.
+	const activeTextLayerTasks = new Set<{ cancel: () => void }>();
 	let renderCancelRequested = false;
 	// Idle-time bitmap encodes still pending for this viewer session.
 	let pendingEncodes = new Set<string>();
@@ -113,14 +115,14 @@
 			}
 			activeRenderTask = null;
 		}
-		if (activeTextLayerTask) {
+		for (const task of activeTextLayerTasks) {
 			try {
-				activeTextLayerTask.cancel();
+				task.cancel();
 			} catch {
 				// noop
 			}
-			activeTextLayerTask = null;
 		}
+		activeTextLayerTasks.clear();
 	};
 
 	// Keep the math-based scroll tracking (cumulative page offsets) in sync.
@@ -568,6 +570,58 @@
 		}
 	};
 
+	// Fire-and-forget text layer construction. The canvas is what the user
+	// sees; text selection appears a moment later. This is NEVER awaited by
+	// the render queue, so its two pdf.js worker roundtrips (getTextContent +
+	// TextLayer.render) cannot stall the drain loop.
+	const buildTextLayerInBackground = (
+		pageNumber: number,
+		page: import('pdfjs-dist').PDFPageProxy,
+		pdfjsLib: Awaited<ReturnType<typeof loadPdfJs>>,
+		wrapper: HTMLElement,
+		cssViewport: import('pdfjs-dist').PageViewport,
+		token: number
+	) => {
+		if (textLayerByPage.has(pageNumber)) return;
+		const textLayerDiv = document.createElement('div');
+		textLayerDiv.className = 'textLayer';
+		wrapper.appendChild(textLayerDiv);
+		void (async () => {
+			const textStart = Date.now();
+			try {
+				const textContent = await page.getTextContent();
+				const textLayer = new pdfjsLib.TextLayer({
+					textContentSource: textContent,
+					container: textLayerDiv,
+					viewport: cssViewport
+				});
+				activeTextLayerTasks.add(textLayer);
+				try {
+					await textLayer.render();
+				} catch (error) {
+					if (renderCancelRequested) {
+						renderCancelRequested = false;
+						return;
+					}
+					console.warn('PDF text layer error:', error);
+					return;
+				} finally {
+					activeTextLayerTasks.delete(textLayer);
+				}
+				if (token !== renderToken || !sceneElement || !renderedPages.has(pageNumber)) {
+					// Page was re-rendered / unrendered / doc switched meanwhile.
+					textLayerDiv.remove();
+					return;
+				}
+				textLayerByPage.set(pageNumber, textLayer);
+				console.warn(`[PDF] page ${pageNumber} text layer in ${Date.now() - textStart}ms`);
+			} catch {
+				// Background work must never crash the render loop.
+				textLayerDiv.remove();
+			}
+		})();
+	};
+
 	// Render canvas + text layer for one page into its placeholder wrapper.
 	const renderPageInto = async (pageNumber: number) => {
 		if (!pdfDoc || !sceneElement) return;
@@ -632,7 +686,12 @@
 			? renderCacheKey(cacheKey, pageNumber, lastRenderedZoom, dpr, cssScale)
 			: '';
 		const cacheStart = Date.now();
-		const cachedBitmap = renderKey ? await loadCachedRender(renderKey) : null;
+		// Memory hits are checked synchronously (no microtask, no IndexedDB);
+		// only on a memory miss do we pay the async IndexedDB lookup.
+		let cachedBitmap = renderKey ? peekCachedRender(renderKey) : null;
+		if (renderKey && !cachedBitmap) {
+			cachedBitmap = await loadCachedRender(renderKey);
+		}
 		if (token !== renderToken) return;
 
 		if (cachedBitmap) {
@@ -675,31 +734,10 @@
 		}
 		if (token !== renderToken) return;
 
-		// Create text layer overlay — pdfjs setLayerDimensions handles its sizing
-		const textLayerDiv = document.createElement('div');
-		textLayerDiv.className = 'textLayer';
-		wrapper.appendChild(textLayerDiv);
-
-		const textContent = await page.getTextContent();
-		const textLayer = new pdfjs.TextLayer({
-			textContentSource: textContent,
-			container: textLayerDiv,
-			viewport: cssViewport
-		});
-		activeTextLayerTask = textLayer;
-		try {
-			await textLayer.render();
-		} catch (error) {
-			if (renderCancelRequested) {
-				renderCancelRequested = false;
-				return;
-			}
-			throw error;
-		} finally {
-			if (activeTextLayerTask === textLayer) activeTextLayerTask = null;
-		}
-		if (token !== renderToken) return;
-		textLayerByPage.set(pageNumber, textLayer);
+		// Text selection is built fire-and-forget: its two pdf.js worker
+		// roundtrips (getTextContent + TextLayer.render) must never stall the
+		// render queue — the canvas is what the user sees.
+		buildTextLayerInBackground(pageNumber, page, pdfjs, wrapper, cssViewport, token);
 
 		renderedPages.add(pageNumber);
 		pageRenderZoom.set(pageNumber, lastRenderedZoom);

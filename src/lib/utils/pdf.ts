@@ -121,7 +121,13 @@ import {
 } from '$lib/utils/fileCache';
 
 const bitmapCache = new Map<string, { bitmap: ImageBitmap; at: number }>();
-const MAX_CACHED_BITMAPS = 12;
+// 1 GB budget: a rendered page bitmap at ~1920x2500 RGBA is ~19 MB, so ~50
+// bitmaps fit. This MUST be large enough to survive multiple display_file
+// calls: every call mounts a NEW viewer (fresh renderedPages set) that
+// redraws the visible pages from cache — if they were evicted to IndexedDB,
+// each page pays a 70-300 ms decode per call (the observed "every call gets
+// slower" behaviour). 50 entries keep a whole working set hot in memory.
+const MAX_CACHED_BITMAPS = 50;
 
 export const renderCacheKey = (
 	fileKey: string,
@@ -130,6 +136,22 @@ export const renderCacheKey = (
 	dpr: number,
 	cssScale: number
 ) => `${fileKey}|p${page}|z${Math.round(zoom * 100)}|d${dpr}|c${Math.round(cssScale * 1000)}`;
+
+/**
+ * Synchronous memory-cache peek — returns a cached bitmap WITHOUT any await.
+ * Used on the render hot path: a memory hit costs zero microtasks, so the
+ * render queue can draw cached pages back-to-back without yielding to the
+ * browser (each await is a checkpoint where pending work / GC / the pdf.js
+ * worker queue can stall the drain loop for seconds).
+ */
+export const peekCachedRender = (key: string): ImageBitmap | null => {
+	const hit = bitmapCache.get(key);
+	if (hit) {
+		hit.at = Date.now();
+		return hit.bitmap;
+	}
+	return null;
+};
 
 export const loadCachedRender = async (key: string): Promise<ImageBitmap | null> => {
 	const memoryHit = bitmapCache.get(key);
