@@ -795,14 +795,20 @@
 			ioSuspended = false;
 			// Enqueue pages that became visible while the queue was draining.
 			// They were collected in pendingIOPages; only those still wanted
-			// (i.e., still near the viewport) are enqueued.
+			// (i.e., still near the viewport) are enqueued. Push directly to
+			// the queue (with dedup) and trigger a single runRenderQueue —
+			// calling enqueuePageRender here would recurse via its own
+			// runRenderQueue call and overflow the stack.
 			if (pendingIOPages.size > 0) {
 				for (const page of pendingIOPages) {
-					if (wantedPages.has(page)) {
-						enqueuePageRender(page);
+					if (wantedPages.has(page) && !renderQueue.includes(page)) {
+						renderQueue.push(page);
 					}
 				}
 				pendingIOPages.clear();
+				if (renderQueue.length > 0) {
+					void runRenderQueue();
+				}
 			}
 			console.warn(`[PDF] queue drained in ${Date.now() - queueStart}ms`);
 		}
