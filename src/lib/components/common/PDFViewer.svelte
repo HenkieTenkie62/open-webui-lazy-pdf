@@ -236,10 +236,23 @@
 		if (singlePage) return;
 
 		await tick();
-		const pageWrapper = sceneElement.querySelectorAll('.pdf-page-wrapper')[page - 1] as
-			| HTMLElement
-			| undefined;
-		pageWrapper?.scrollIntoView({ block: 'start' });
+
+		// Set scrollTop directly from the cumulative page offsets instead of
+		// using scrollIntoView: panzoom applies a CSS transform to sceneElement,
+		// which makes scrollIntoView unreliable (it commonly lands on page 1
+		// regardless of the requested page).
+		let targetTop = 0;
+		if (pageCssOffsets.length >= page) {
+			targetTop = pageCssOffsets[page - 1];
+		} else {
+			// Offsets not seeded yet — measure the wrappers directly as a fallback.
+			const wrappers = sceneElement.querySelectorAll('.pdf-page-wrapper');
+			for (let i = 0; i < page - 1 && i < wrappers.length; i++) {
+				targetTop += (wrappers[i] as HTMLElement).offsetHeight + (i > 0 ? 4 : 0);
+			}
+		}
+
+		outerContainer.scrollTop = targetTop;
 		activePage = page;
 		onPageChange?.(page);
 		// The requested page renders with strict priority and shows first;
@@ -941,9 +954,16 @@
 
 		const source = data ?? url;
 		// Same file requested again — the document + page bitmaps are already
-		// loaded and shared, so a new display_file for the same path is instant.
-		if (cacheKey && pdfDoc && loadedCacheKey === cacheKey) return;
+		// loaded and shared. Only (re)scroll to the requested page if it changed.
+		if (cacheKey && pdfDoc && loadedCacheKey === cacheKey) {
+			const page = clampDocumentTargetPage(targetPage, pdfDoc.numPages);
+			if (page && page !== activePage) {
+				await scrollToTargetPage();
+			}
+			return;
+		}
 		if (source === loadedSource && pdfDoc) return;
+		const t0 = Date.now();
 		const token = ++loadToken;
 		loadedSource = source;
 		loading = true;
@@ -1000,6 +1020,7 @@
 			}
 			if (token !== loadToken) return;
 			pageCount = pdfDoc.numPages;
+			console.warn(`[PDF] doc ready in ${Date.now() - t0}ms, ${pageCount} pages`);
 			activePage = clampDocumentTargetPage(targetPage, pageCount) ?? 1;
 			targetPage = clampDocumentTargetPage(targetPage, pageCount) ?? 1;
 			if (singlePage) {
