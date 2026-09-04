@@ -65,6 +65,12 @@
 	let pageRenderZoom: Map<number, number> = new Map();
 	let renderQueue: number[] = [];
 	let renderQueueRunning = false;
+	// While the render queue is draining, IntersectionObserver callbacks must not
+	// push more pages into the queue — otherwise the queue never empties (IO adds
+	// pages faster than they can be rendered). Pages observed during a run are
+	// collected here and enqueued only after the queue has fully drained.
+	let ioSuspended = false;
+	let pendingIOPages: Set<number> = new Set();
 	let releaseDoc: (() => void) | null = null;
 	// Tracks the in-flight pdf.js render/text-layer task so switching documents can
 	// actively cancel them and free the shared pdf.js worker for the new file.
@@ -374,6 +380,7 @@
 		renderQueue = [];
 		priorityPage = null;
 		renderCacheOrder = [];
+		pendingIOPages = new Set();
 
 		const pageNumber = clampDocumentTargetPage(targetPage, pdfDoc.numPages) ?? 1;
 		const page = await pdfDoc.getPage(pageNumber);
@@ -421,6 +428,7 @@
 		renderQueue = [];
 		priorityPage = null;
 		renderCacheOrder = [];
+		pendingIOPages = new Set();
 
 		// The requested page is fetched first and its size seeds the placeholders
 		// for every other page, so the document appears immediately without
@@ -731,6 +739,11 @@
 	const runRenderQueue = async () => {
 		if (renderQueueRunning) return;
 		renderQueueRunning = true;
+		// Suspend IntersectionObserver enqueues while we drain — otherwise IO
+		// keeps pushing pages into the queue faster than we render them, and
+		// the queue never empties (observed as a 20s+ "freeze" after a page
+		// jump, with all pages being cache hits).
+		ioSuspended = true;
 		const queueStart = Date.now();
 		console.warn(`[PDF] queue starting, depth=${renderQueue.length}`);
 		try {
@@ -779,6 +792,18 @@
 			}
 		} finally {
 			renderQueueRunning = false;
+			ioSuspended = false;
+			// Enqueue pages that became visible while the queue was draining.
+			// They were collected in pendingIOPages; only those still wanted
+			// (i.e., still near the viewport) are enqueued.
+			if (pendingIOPages.size > 0) {
+				for (const page of pendingIOPages) {
+					if (wantedPages.has(page)) {
+						enqueuePageRender(page);
+					}
+				}
+				pendingIOPages.clear();
+			}
 			console.warn(`[PDF] queue drained in ${Date.now() - queueStart}ms`);
 		}
 	};
@@ -872,10 +897,17 @@
 					if (entry.isIntersecting) {
 						wantedPages.add(pageNumber);
 						touchRenderCache(pageNumber);
-						enqueuePageRender(pageNumber);
+						if (ioSuspended) {
+							pendingIOPages.add(pageNumber);
+						} else {
+							enqueuePageRender(pageNumber);
+						}
 					} else {
 						// Stay rendered (render cache) until LRU eviction frees it.
 						wantedPages.delete(pageNumber);
+						if (ioSuspended) {
+							pendingIOPages.delete(pageNumber);
+						}
 					}
 				}
 			},
